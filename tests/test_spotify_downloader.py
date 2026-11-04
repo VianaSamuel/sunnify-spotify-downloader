@@ -704,6 +704,341 @@ class TestYoutubeMatchSelection:
             assert MusicScraper._normalize_title(raw) == expected, raw
 
 
+class TestPreferExtended:
+    """Opt-in option: try each track's extended mix first."""
+
+    RADIO = 200  # spotify duration of the radio edit, seconds
+
+    @staticmethod
+    def _scraper(**kw):
+        from Spotify_Downloader import MusicScraper
+
+        return MusicScraper(prefer_extended=True, **kw)
+
+    def _pick(self, entries, title="Titanium (feat. Sia)", artists="David Guetta, Sia"):
+        scraper = self._scraper()
+        ydl = MagicMock()
+        ydl.extract_info = MagicMock(return_value={"entries": entries})
+        scraper._youtube = MagicMock()
+        scraper._youtube.return_value.__enter__ = MagicMock(return_value=ydl)
+        scraper._youtube.return_value.__exit__ = MagicMock(return_value=False)
+        url = scraper._select_extended_match(title, artists, self.RADIO)
+        return url, ydl
+
+    def test_off_by_default(self):
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper().prefer_extended is False
+
+    def test_searches_for_the_extended_mix_without_spotify_qualifiers(self):
+        _, ydl = self._pick([])
+        query = ydl.extract_info.call_args[0][0]
+        assert query.startswith("ytsearch10:Titanium David Guetta, Sia extended mix")
+        assert "feat" not in query
+
+    def test_prefers_topic_channel_then_views(self):
+        entries = [
+            {
+                "id": "fan",
+                "title": "David Guetta - Titanium (Extended Mix)",
+                "duration": 330,
+                "channel": "EDM Uploads",
+                "view_count": 9_000_000,
+            },
+            {
+                "id": "topic",
+                "title": "Titanium (feat. Sia) (Extended)",
+                "duration": 345,
+                "channel": "David Guetta - Topic",
+                "view_count": 40_000,
+            },
+        ]
+        url, _ = self._pick(entries)
+        assert url == "https://www.youtube.com/watch?v=topic"
+
+    def test_most_viewed_wins_without_a_topic_channel(self):
+        entries = [
+            {"id": "few", "title": "David Guetta - Titanium Extended", "duration": 330},
+            {
+                "id": "many",
+                "title": "David Guetta - Titanium ft. Sia (Extended Mix)",
+                "duration": 340,
+                "view_count": 2_000_000,
+            },
+        ]
+        url, _ = self._pick(entries)
+        assert url == "https://www.youtube.com/watch?v=many"
+
+    def test_rejects_remix_live_short_loops_and_wrong_artist(self):
+        entries = [
+            {"id": "remix", "title": "David Guetta - Titanium (Extended Remix)", "duration": 360},
+            {"id": "live", "title": "David Guetta - Titanium Extended (Live)", "duration": 360},
+            {"id": "short", "title": "David Guetta - Titanium Extended", "duration": 205},
+            {"id": "loop", "title": "David Guetta - Titanium Extended 1 Hour", "duration": 3600},
+            {"id": "nodur", "title": "David Guetta - Titanium (Extended Mix)"},
+            {"id": "other", "title": "Someone Else - Titanium (Extended Mix)", "duration": 330},
+            {"id": "plain", "title": "David Guetta - Titanium (Official Video)", "duration": 245},
+        ]
+        url, _ = self._pick(entries)
+        assert url is None
+
+    def test_artist_can_come_from_the_channel_name(self):
+        entries = [
+            {
+                "id": "chan",
+                "title": "Titanium (Extended Mix)",
+                "duration": 330,
+                "channel": "David Guetta",
+            }
+        ]
+        url, _ = self._pick(entries)
+        assert url == "https://www.youtube.com/watch?v=chan"
+
+    def test_a_remix_track_may_get_its_extended_remix(self):
+        entries = [
+            {
+                "id": "xremix",
+                "title": "David Guetta - Titanium (Alesso Remix) [Extended]",
+                "duration": 360,
+            }
+        ]
+        url, _ = self._pick(entries, title="Titanium - Alesso Remix")
+        assert url == "https://www.youtube.com/watch?v=xremix"
+
+    def test_skips_search_when_spotify_track_is_already_extended(self):
+        url, ydl = self._pick([], title="Titanium - Extended Mix")
+        assert url is None
+        ydl.extract_info.assert_not_called()
+
+    def test_download_tries_extended_first_then_falls_back(self, tmp_path):
+        """An extended URL that lands nothing falls through to the regular match."""
+        scraper = self._scraper()
+        dest = str(tmp_path / "Titanium - David Guetta.mp3")
+        downloaded = []
+
+        def fake_extract(url, download=False):
+            downloaded.append(url)
+            if url.endswith("regular"):
+                open(dest, "wb").close()
+            return {}
+
+        ydl = MagicMock()
+        ydl.extract_info = MagicMock(side_effect=fake_extract)
+        scraper._youtube = MagicMock()
+        scraper._youtube.return_value.__enter__ = MagicMock(return_value=ydl)
+        scraper._youtube.return_value.__exit__ = MagicMock(return_value=False)
+        with (
+            patch("Spotify_Downloader.get_ffmpeg_path", return_value="/usr/bin"),
+            patch.object(
+                scraper,
+                "_select_extended_match",
+                return_value="https://www.youtube.com/watch?v=extended",
+            ) as ext,
+            patch.object(
+                scraper,
+                "_select_youtube_match",
+                return_value="https://www.youtube.com/watch?v=regular",
+            ),
+        ):
+            out = scraper.download_track_audio(
+                "ytsearch1:Titanium David Guetta audio",
+                dest,
+                expected_duration_s=self.RADIO,
+                expected_title="Titanium",
+                expected_artists="David Guetta",
+            )
+        assert out == dest
+        ext.assert_called_once_with("Titanium", "David Guetta", self.RADIO)
+        assert downloaded[0].endswith("extended")
+        assert downloaded[-1].endswith("regular")
+
+    def test_download_skips_extended_search_when_off(self, tmp_path):
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper()
+        with (
+            patch("Spotify_Downloader.get_ffmpeg_path", return_value="/usr/bin"),
+            patch.object(scraper, "_select_extended_match") as ext,
+            patch.object(scraper, "_select_youtube_match", return_value=None),
+            contextlib.suppress(RuntimeError),
+        ):
+            scraper.download_track_audio("ytsearch1:x", str(tmp_path / "x.mp3"))
+        ext.assert_not_called()
+
+    # real results for "Innerbloom" (2026): the long cut has no "extended" in its
+    # title, and the one video that says "Extended Mix" is a one-hour loop
+    INNERBLOOM = [
+        {
+            "id": "official",
+            "title": "RÜFÜS DU SOL ●● Innerbloom (Official Video)",
+            "duration": 579,
+            "channel": "RÜFÜS DU SOL",
+            "view_count": 229025522,
+        },
+        {
+            "id": "label",
+            "title": "RÜFÜS DU SOL - Innerbloom",
+            "duration": 579,
+            "channel": "Foreign Family Collective",
+            "view_count": 5972614,
+        },
+        {
+            "id": "edit",
+            "title": "Innerbloom (Radio Edit)",
+            "duration": 239,
+            "channel": "RÜFÜS DU SOL",
+            "view_count": 12310568,
+        },
+        {
+            "id": "loop",
+            "title": "RÜFÜS DU SOL - Innerbloom (Extended Mix) - Version 1 Hour",
+            "duration": 4011,
+            "channel": "Mr Zafiro",
+            "view_count": 69553,
+        },
+        {
+            "id": "fragment",
+            "title": "Innerbloom - RÜFÜS DU SOL (extended part)",
+            "duration": 153,
+            "channel": "Meg",
+            "view_count": 531,
+        },
+    ]
+
+    def _pick_innerbloom(self, entries, title="Innerbloom - Radio Edit"):
+        scraper = self._scraper()
+        ydl = MagicMock()
+        ydl.extract_info = MagicMock(return_value={"entries": entries})
+        scraper._youtube = MagicMock()
+        scraper._youtube.return_value.__enter__ = MagicMock(return_value=ydl)
+        scraper._youtube.return_value.__exit__ = MagicMock(return_value=False)
+        return scraper, scraper._select_extended_match(title, "RÜFÜS DU SOL", 239)
+
+    def test_radio_edit_gets_the_artists_full_length_upload(self):
+        scraper, url = self._pick_innerbloom(self.INNERBLOOM)
+        assert url == "https://www.youtube.com/watch?v=official"
+        assert scraper._tls.pick[0] == "full"
+
+    def test_full_length_needs_the_artists_own_channel(self):
+        entries = [e for e in self.INNERBLOOM if e["id"] != "official"]
+        assert self._pick_innerbloom(entries)[1] is None
+
+    def test_full_length_only_replaces_an_edit(self):
+        """A plain "Innerbloom" isn't a shortened cut: nothing to lengthen."""
+        assert self._pick_innerbloom(self.INNERBLOOM, title="Innerbloom")[1] is None
+
+    def test_named_extended_mix_beats_full_length(self):
+        entries = [
+            *self.INNERBLOOM,
+            {
+                "id": "ext",
+                "title": "RÜFÜS DU SOL - Innerbloom (Extended Mix)",
+                "duration": 420,
+                "channel": "Fans",
+            },
+        ]
+        scraper, url = self._pick_innerbloom(entries)
+        assert url == "https://www.youtube.com/watch?v=ext"
+        assert scraper._tls.pick[0] == "extended"
+
+    @pytest.mark.parametrize(
+        ("spotify", "landed", "expected"),
+        [
+            (
+                "The Weekend - Radio Edit",
+                ("extended", "The Weekend (Extended Vocal Mix)"),
+                "The Weekend (Extended Vocal Mix)",
+            ),
+            (
+                "World Hold On (Children of the Sky) - Radio Edit",
+                ("extended", "Bob Sinclar - World Hold On (Extended Club Mix) 2006"),
+                "World Hold On (Children of the Sky) (Extended Club Mix)",
+            ),
+            ("Stereo Love", ("extended", "Stereo Love extended"), "Stereo Love (Extended Mix)"),
+            ("Song (Radio Edit)", ("extended", "Song [Extended]"), "Song (Extended)"),
+            ("Innerbloom - Radio Edit", ("full", "Innerbloom (Official Video)"), "Innerbloom"),
+            (
+                "Song - Alesso Edit",
+                ("extended", "Song (Extended)"),
+                "Song - Alesso Edit (Extended)",
+            ),
+            ("Song - Radio Edit", ("match", "Song"), "Song - Radio Edit"),
+            ("Song - Radio Edit", ("loose", "Song"), "Song - Radio Edit"),
+        ],
+    )
+    def test_landed_title_says_what_downloaded(self, spotify, landed, expected):
+        scraper = self._scraper()
+        scraper._tls.landed = (landed[0], "url", landed[1])
+        assert scraper._landed_title(spotify) == expected
+
+    def _landed_track(self, tmp_path, title="Song - Radio Edit", video="Song (Extended Mix)"):
+        from spotifydown_api import TrackInfo
+
+        scraper = self._scraper()
+        for sig in ("song_meta", "add_song_meta", "dlprogress_signal", "count_updated"):
+            setattr(scraper, sig, MagicMock())
+        scraper._load_manifest(str(tmp_path))
+
+        def fake(_query, dest, **_kw):
+            open(dest, "wb").close()
+            scraper._tls.landed = ("extended", "url", video)
+            return dest
+
+        scraper.download_track_audio = fake
+        track = TrackInfo(
+            id="t1",
+            title=title,
+            artists="Artist",
+            album="Album",
+            release_date="2024",
+            cover_url="https://x/y.jpg",
+            duration_ms=None,
+            preview_url=None,
+            raw={},
+        )
+        return scraper, track
+
+    def test_file_and_tags_take_the_real_title(self, tmp_path):
+        scraper, track = self._landed_track(tmp_path)
+        scraper._download_one_track(track, str(tmp_path), "", 1)
+        audio = [f for f in os.listdir(tmp_path) if not f.startswith(".")]
+        assert audio == ["Song (Extended Mix) - Artist.mp3"]
+        meta = scraper.add_song_meta.emit.call_args[0][0]
+        assert meta["title"] == "Song (Extended Mix)"
+        assert meta["file"] == str(tmp_path / "Song (Extended Mix) - Artist.mp3")
+        assert scraper._in_flight_files == set()
+
+    def test_renamed_track_is_skipped_on_the_next_run(self, tmp_path):
+        scraper, track = self._landed_track(tmp_path)
+        scraper._download_one_track(track, str(tmp_path), "", 1)
+        again, _ = self._landed_track(tmp_path)
+        assert again._load_manifest(str(tmp_path)) == {"t1"}
+
+    def test_rename_never_overwrites_another_tracks_file(self, tmp_path):
+        scraper, track = self._landed_track(tmp_path)
+        taken = tmp_path / "Song (Extended Mix) - Artist.mp3"
+        taken.write_bytes(b"other")
+        scraper._manifest_owners[taken.name.casefold()] = "someone-else"
+        scraper._download_one_track(track, str(tmp_path), "", 1)
+        assert taken.read_bytes() == b"other"
+        assert (tmp_path / "Song (Extended Mix) - Artist [t1].mp3").exists()
+
+    def test_setting_reaches_scraper_and_cli(self):
+        from Spotify_Downloader import SETTINGS, scraper_kwargs_from
+
+        setting = next(s for s in SETTINGS if s.key == "prefer_extended")
+        assert setting.cli_flag == "--prefer-extended"
+        assert scraper_kwargs_from({"prefer_extended": True})["prefer_extended"] is True
+
+    def test_settings_dialog_round_trips_it(self, qapp):
+        from Spotify_Downloader import SettingsDialog
+
+        dlg = SettingsDialog(None, {"prefer_extended": True})
+        assert dlg._prefer_extended_cb.isChecked()
+        dlg._prefer_extended_cb.setChecked(False)
+        assert dlg.result_config()["prefer_extended"] is False
+
+
 class TestDetectImageMime:
     """Tests for _detect_image_mime image-format sniffing (closes #46).
 
@@ -3177,6 +3512,7 @@ class TestDownloadQueue:
                 self.progress_update = MagicMock()
                 self.finished = MagicMock()
                 self.scraper = MagicMock()
+                self.scraper._total_tracks = 0
 
             def start(self):
                 started.append(self.url)
@@ -3196,6 +3532,120 @@ class TestDownloadQueue:
         win._download_path_set = True
         win.download_path = str(tmp_path)
         return win, started
+
+    def test_idle_window_shows_a_hint_instead_of_empty_fields(self, qapp, monkeypatch, tmp_path):
+        win, _ = self._window(monkeypatch, tmp_path)
+        assert not win.idleBox.isHidden()
+        assert win.activeBox.isHidden()
+        assert win.CounterLabel.isHidden()
+        assert win.SongDownloadprogress.isHidden()
+        assert win.statusMsg.text() == ""
+
+    def test_late_cover_of_an_older_track_is_ignored(self, qapp, monkeypatch, tmp_path):
+        """Workers overlap, so the first track's cover can arrive after the
+        last one's; the preview must keep the cover that matches its title."""
+        from PyQt6.QtCore import QBuffer, QIODevice
+        from PyQt6.QtGui import QImage
+
+        import Spotify_Downloader as sd
+
+        win, _ = self._window(monkeypatch, tmp_path)
+        monkeypatch.setattr(sd.DownloadThumbnail, "start", lambda _self: None)
+        win.showPreviewCheck.blockSignals(True)
+        win.showPreviewCheck.setChecked(True)
+        win.update_song_META({"title": "Old", "artists": "A", "cover": "https://x/old"})
+        win.update_song_META({"title": "New", "artists": "A", "cover": "https://x/new"})
+        old, new = [t for t in win._active_threads if isinstance(t, sd.DownloadThumbnail)]
+
+        def png(color):
+            image = QImage(2, 2, QImage.Format.Format_RGB32)
+            image.fill(color)
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            image.save(buffer, "PNG")
+            return bytes(buffer.data())
+
+        new._update_ui(png(0xFF0000))
+        old._update_ui(png(0x0000FF))
+        assert win.CoverImg.pixmap().toImage().pixelColor(0, 0).red() == 255
+
+    def _window_showing_a_cover(self, monkeypatch, tmp_path):
+        from PyQt6.QtGui import QPixmap
+
+        import Spotify_Downloader as sd
+
+        win, _ = self._window(monkeypatch, tmp_path)
+        monkeypatch.setattr(sd.DownloadThumbnail, "start", lambda _self: None)
+        win.showPreviewCheck.blockSignals(True)
+        win.showPreviewCheck.setChecked(True)
+        pixmap = QPixmap(2, 2)
+        pixmap.fill()
+        win.CoverImg.setPixmap(pixmap)
+        return win, sd
+
+    def test_song_without_a_cover_link_shows_the_empty_template(self, qapp, monkeypatch, tmp_path):
+        win, _sd = self._window_showing_a_cover(monkeypatch, tmp_path)
+        win.update_song_META({"title": "No art", "artists": "A", "cover": ""})
+        assert win.CoverImg.pixmap().isNull()
+
+    def test_cover_that_fails_to_load_shows_the_empty_template(self, qapp, monkeypatch, tmp_path):
+        win, sd = self._window_showing_a_cover(monkeypatch, tmp_path)
+        win.update_song_META({"title": "Broken", "artists": "A", "cover": "https://x/broken"})
+        thread = next(t for t in win._active_threads if isinstance(t, sd.DownloadThumbnail))
+        with patch("Spotify_Downloader.requests.get", side_effect=OSError("offline")):
+            thread.run()
+        assert win.CoverImg.pixmap().isNull()
+
+    def test_preview_credits_album_and_year(self, qapp, monkeypatch, tmp_path):
+        win, _ = self._window(monkeypatch, tmp_path)
+        win._set_release_line("Is This It", "2001-07-30")
+        assert win.YearText.text() == "Is This It · 2001"
+        assert not win.YearText.isHidden()
+        win._set_release_line("", "1978")
+        assert win.YearText.text() == "1978"
+        win._set_release_line("", "")
+        assert win.YearText.isHidden()
+
+    def test_running_shows_progress_and_counter_only_after_first_song(
+        self, qapp, monkeypatch, tmp_path
+    ):
+        win, _ = self._window(monkeypatch, tmp_path)
+        win.PlaylistLink.setText(self.A)
+        win.on_returnButton()
+        assert win.idleBox.isHidden()
+        assert not win.activeBox.isHidden()
+        assert win.CounterLabel.isHidden()
+        assert win.DownloadBtn.property("running") is True
+        win.update_counter(1)
+        assert not win.CounterLabel.isHidden()
+
+    def test_run_that_never_named_a_song_goes_back_to_idle(self, qapp, monkeypatch, tmp_path):
+        win, _ = self._window(monkeypatch, tmp_path)
+        win.PlaylistLink.setText(self.A)
+        win.on_returnButton()
+        win.thread_finished()
+        assert not win.idleBox.isHidden()
+        assert win.DownloadBtn.property("running") is False
+
+    def test_finished_run_keeps_its_results_on_screen(self, qapp, monkeypatch, tmp_path):
+        win, _ = self._window(monkeypatch, tmp_path)
+        win.PlaylistLink.setText(self.A)
+        win.on_returnButton()
+        win.update_song_META({"title": "Song", "artists": "Artist"})
+        win.update_counter(1)
+        win.thread_finished()
+        assert win.idleBox.isHidden()
+        assert win.MainSongName.text() == "Song - Artist"
+        assert not win.CounterLabel.isHidden()
+
+    def test_long_names_are_elided_with_the_full_text_in_the_tooltip(
+        self, qapp, monkeypatch, tmp_path
+    ):
+        win, _ = self._window(monkeypatch, tmp_path)
+        name = "A very long playlist name " * 6
+        win.update_AlbumName(name)
+        assert win.AlbumName.text() != name
+        assert win.AlbumName.toolTip() == name
 
     def test_enter_queues_while_downloading_and_runs_in_order(self, qapp, monkeypatch, tmp_path):
         win, started = self._window(monkeypatch, tmp_path)
@@ -3965,18 +4415,18 @@ class TestDownloadReportingAccuracy:
     def test_counter_subtracts_failures(self, qapp):
         win = self._window_with(10, ["a", "b"])
         win.update_counter(5)
-        assert win.CounterLabel.text() == "Songs downloaded 3 of 10 (2 failed)"
+        assert win.CounterLabel.text() == "03 / 10 downloaded · 2 failed"
 
     def test_counter_omits_failure_clause_when_clean(self, qapp):
         win = self._window_with(10, [])
         win.update_counter(5)
-        assert win.CounterLabel.text() == "Songs downloaded 5 of 10"
+        assert win.CounterLabel.text() == "05 / 10 downloaded"
 
     def test_counter_all_failed_reads_zero(self, qapp):
         """The reported symptom: 66 of 66 while nothing landed."""
         win = self._window_with(66, [f"t{i}" for i in range(66)])
         win.update_counter(66)
-        assert win.CounterLabel.text() == "Songs downloaded 0 of 66 (66 failed)"
+        assert win.CounterLabel.text() == "00 / 66 downloaded · 66 failed"
 
     def test_counter_survives_a_dead_scraper_thread(self, qapp):
         """Qt raises RuntimeError on a deleted object; the slot still fires."""
@@ -3987,7 +4437,7 @@ class TestDownloadReportingAccuracy:
         type(thread).scraper = property(lambda _self: (_ for _ in ()).throw(RuntimeError()))
         win.scraper_thread = thread
         win.update_counter(3)
-        assert win.CounterLabel.text() == "Songs downloaded 3"
+        assert win.CounterLabel.text() == "3 downloaded"
 
     def test_star_prompt_skipped_when_nothing_landed(self, qapp, monkeypatch):
         win = self._window_with(5, ["only-track"])
@@ -4111,6 +4561,174 @@ class TestAudioFormatExtension:
         second.download_track_audio = lambda q, d, **k: (attempted.append(d), real(q, d, **k))[1]
         second._download_one_track(self._track("tA", "Song", "Artist"), str(tmp_path), "", 1)
         assert attempted == [], f"{fmt}: re-downloaded a track already on disk"
+
+
+class TestRunReport:
+    """End-of-run report: what didn't download and what to double-check."""
+
+    @pytest.fixture(autouse=True)
+    def _no_update_thread(self, monkeypatch):
+        import Spotify_Downloader as sd
+
+        monkeypatch.setattr(sd.UpdateCheckThread, "start", lambda _self: None)
+
+    @staticmethod
+    def _track(tid="t1", title="Title"):
+        from spotifydown_api import TrackInfo
+
+        return TrackInfo(
+            id=tid,
+            title=title,
+            artists="Artist",
+            album="Album",
+            release_date="2024-01-01",
+            cover_url="https://x/y.jpg",
+            duration_ms=None,
+            preview_url=None,
+            raw={},
+        )
+
+    @staticmethod
+    def _scraper(**kw):
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper(**kw)
+        for sig in (
+            "song_meta",
+            "add_song_meta",
+            "dlprogress_signal",
+            "Resetprogress_signal",
+            "PlaylistCompleted",
+            "error_signal",
+            "count_updated",
+        ):
+            setattr(scraper, sig, MagicMock())
+        return scraper
+
+    def test_failed_track_lands_in_report_with_a_short_reason(self, tmp_path):
+        scraper = self._scraper()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("no playable audio source found on YouTube for this track")
+
+        scraper.download_track_audio = boom
+        scraper._download_one_track(self._track(), str(tmp_path), "", 1)
+        assert scraper._failed_tracks == ["Title"]
+        assert scraper._report == [
+            {
+                "kind": "failed",
+                "title": "Title",
+                "artists": "Artist",
+                "detail": "No confident match on YouTube",
+                "url": None,
+            }
+        ]
+
+    def test_failure_reasons_are_short(self):
+        scraper = self._scraper()
+        assert scraper._failure_reason(None) == "No audio file was produced"
+        assert scraper._failure_reason(RuntimeError("Video unavailable")) == (
+            "Unavailable on YouTube"
+        )
+        assert scraper._failure_reason(RuntimeError("weird\nsecond line")) == "weird"
+
+    def _landing(self, tmp_path, how, scraper=None):
+        """Run download_track_audio with a pick tagged `how`, landing a file."""
+        scraper = scraper or self._scraper()
+        dest = str(tmp_path / "Title - Artist.mp3")
+
+        def pick(*_a, **_k):
+            if how != "match":
+                scraper._tls.pick = (how, "YT Title")
+            return "https://www.youtube.com/watch?v=abc"
+
+        ydl = MagicMock()
+        ydl.extract_info = MagicMock(side_effect=lambda *_a, **_k: open(dest, "wb").close())
+        scraper._youtube = MagicMock()
+        scraper._youtube.return_value.__enter__ = MagicMock(return_value=ydl)
+        scraper._youtube.return_value.__exit__ = MagicMock(return_value=False)
+        with (
+            patch("Spotify_Downloader.get_ffmpeg_path", return_value="/usr/bin"),
+            patch.object(scraper, "_select_youtube_match", side_effect=pick),
+            patch.object(scraper, "_select_extended_match", return_value=None),
+        ):
+            scraper.download_track_audio("ytsearch1:Title Artist audio", dest)
+        scraper._note_landed("Title", "Artist")
+        return scraper
+
+    def test_loose_pick_is_reported_to_check(self, tmp_path):
+        scraper = self._landing(tmp_path, "loose")
+        assert [(e["kind"], e["detail"], e["url"]) for e in scraper._report] == [
+            ("check", 'Closest result: "YT Title"', "https://www.youtube.com/watch?v=abc")
+        ]
+
+    def test_strict_match_reports_nothing(self, tmp_path):
+        assert self._landing(tmp_path, "match")._report == []
+
+    def test_regular_version_reported_only_when_extended_was_asked(self, tmp_path):
+        scraper = self._landing(tmp_path, "match", self._scraper(prefer_extended=True))
+        assert [e["kind"] for e in scraper._report] == ["regular"]
+
+    def test_summary_and_copy_text(self):
+        from Spotify_Downloader import report_summary, report_text
+
+        report = {
+            "name": "Mix",
+            "total": 10,
+            "entries": [
+                {"kind": "failed", "title": "A", "artists": "X", "detail": "Unavailable"},
+                {"kind": "check", "title": "B", "artists": "Y", "detail": "c", "url": "u"},
+            ],
+        }
+        assert report_summary(report) == "9 of 10 downloaded · 1 failed · 1 to check"
+        text = report_text(report)
+        assert "Not downloaded (1)\n- A · X: Unavailable" in text
+        assert "- B · Y: c (u)" in text
+
+    def _finished_window(self, entries, cancelled=False):
+        from Spotify_Downloader import MainWindow
+
+        win = MainWindow()
+        thread = MagicMock()
+        thread.isRunning.return_value = False
+        thread.scraper._report = entries
+        thread.scraper._report_name = "Mix"
+        thread.scraper._report_folder = ""
+        thread.scraper._total_tracks = 5
+        thread.scraper._network_blocked = False
+        win.scraper_thread = thread
+        win._has_track = True
+        if cancelled:
+            win._cancel_event.set()
+        win.thread_finished()
+        return win
+
+    def test_run_with_issues_shows_button_and_opens_report(self, qapp):
+        entry = {"kind": "failed", "title": "A", "artists": "X", "detail": "d", "url": None}
+        win = self._finished_window([entry])
+        assert not win.ReportBtn.isHidden()
+        assert win._report_dialog is not None and win._report_dialog.isVisible()
+        win._report_dialog.close()
+
+    def test_stopped_run_keeps_the_button_but_does_not_pop_up(self, qapp):
+        entry = {"kind": "failed", "title": "A", "artists": "X", "detail": "d", "url": None}
+        win = self._finished_window([entry], cancelled=True)
+        assert not win.ReportBtn.isHidden()
+        assert win._report_dialog is None
+
+    def test_clean_run_shows_nothing(self, qapp):
+        win = self._finished_window([])
+        assert win.ReportBtn.isHidden()
+        assert win._report_dialog is None
+
+    def test_counter_turns_warning_color_on_failure(self, qapp):
+        from Spotify_Downloader import MainWindow
+
+        win = MainWindow()
+        win._set_counter_warn(True)
+        assert win.CounterLabel.property("warn") is True
+        win._set_counter_warn(False)
+        assert win.CounterLabel.property("warn") is False
 
 
 class TestFfmpegPreflight:

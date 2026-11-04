@@ -51,10 +51,9 @@ from PyQt6.QtCore import (
     pyqtSignal,
     pyqtSlot,
 )
-from PyQt6.QtGui import QCursor, QImage, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -81,7 +80,7 @@ from spotifydown_api import (
     extract_playlist_id,
     sanitize_filename,
 )
-from Template import Ui_MainWindow
+from Template import ToggleSwitch, Ui_MainWindow
 
 # Module logger. Stays a no-op (no handlers) until _setup_logging() runs at
 # startup, so importing this module in tests stays silent and writes nothing.
@@ -315,6 +314,11 @@ SUPPORTED_QUALITIES = ("128", "192", "256", "320")
 SUPPORTED_SAMPLE_RATES = ("auto", "44100", "48000")
 
 
+def _counted(count: int, noun: str) -> str:
+    """ "1 track", "3 tracks": status text never shows "track(s)"."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
 class _Setting:
     """One user setting: config key, validation, scraper wiring, CLI surface."""
 
@@ -401,6 +405,14 @@ SETTINGS = (
         scraper_kwarg="loose_match",
         cli_flag="--loose-match",
         help="fall back to the closest result when strict matching finds nothing",
+    ),
+    _Setting(
+        "prefer_extended",
+        False,
+        "bool",
+        scraper_kwarg="prefer_extended",
+        cli_flag="--prefer-extended",
+        help="look for each track's extended mix first, falling back to the normal version",
     ),
     _Setting(
         "cookies_file",
@@ -768,6 +780,7 @@ class MusicScraper(QThread):
         title_only: bool = False,
         sample_rate: str = "auto",
         loose_match: bool = False,
+        prefer_extended: bool = False,
         cookies_file: str | None = None,
     ):
         super().__init__()
@@ -776,6 +789,13 @@ class MusicScraper(QThread):
         self.spotifydown_api = None
         self._cancel_event = cancel_event or threading.Event()
         self._failed_tracks: list[str] = []  # Track failed downloads
+        # per-track notes for the end-of-run report (failed / check / regular);
+        # _failed_tracks stays the CLI's source of truth for counts and exit codes
+        self._report: list[dict] = []
+        self._report_name = ""
+        self._report_folder = ""
+        # which YouTube pick landed for the track this worker thread is on
+        self._tls = threading.local()
         # Output options. audio_format must be a key of SUPPORTED_FORMATS;
         # audio_quality only applies to lossy formats (mp3/m4a/opus).
         self.audio_format = audio_format if audio_format in SUPPORTED_FORMATS else "mp3"
@@ -788,6 +808,9 @@ class MusicScraper(QThread):
         # duration-closest youtube result (recovers cross-script matches);
         # off by default so the wrong-audio safeguard (#52) stays the default.
         self.loose_match = bool(loose_match)
+        # opt-in: try the extended mix of each track
+        # before the regular match; the regular match stays the fallback.
+        self.prefer_extended = bool(prefer_extended)
         self.cookies_file = os.path.expanduser(cookies_file) if cookies_file else None
         self._cookies_text = None
         self._js_runtime = None
@@ -870,6 +893,82 @@ class MusicScraper(QThread):
             "being refused. This is applied to your IP, not to Sunnify: try another "
             "network or connection, wait a few hours, or use YouTube cookies (see the docs)."
         )
+
+    def _note_report(self, kind, title, artists, detail, url=None):
+        """One line for the end-of-run report. kind: "failed" (not downloaded),
+        "check" (closest-result pick, may be the wrong audio) or "regular"
+        (extended mix asked for, normal version used)."""
+        with self._failed_lock:
+            self._report.append(
+                {"kind": kind, "title": title, "artists": artists, "detail": detail, "url": url}
+            )
+
+    def _failure_reason(self, error: Exception | None) -> str:
+        """Short why-it-failed for the report, without the track name the
+        status-line message repeats."""
+        if error is None:
+            return "No audio file was produced"
+        text = str(error).lower()
+        if any(m in text for m in self._BLOCK_MARKERS):
+            return "YouTube blocked this network"
+        if isinstance(error, ExtractionError):
+            return "Unavailable"
+        if "no video formats" in text or "no playable audio source" in text:
+            return "No confident match on YouTube"
+        if "unavailable" in text:
+            return "Unavailable on YouTube"
+        return str(error).strip().splitlines()[0][:120] or type(error).__name__
+
+    def _landed_title(self, track_title: str) -> str:
+        """The title for what actually downloaded: Spotify's says "Radio Edit"
+        even when the extended mix landed."""
+        how, _url, video_title = getattr(self._tls, "landed", None) or ("match", None, None)
+        if how not in ("extended", "full"):
+            return track_title
+        base = self._EDIT_SUFFIX.sub("", track_title).strip()
+        if how == "full":
+            return base
+        # keep the upload's own label: an "Extended Vocal Mix" isn't an "Extended Mix"
+        found = re.search(r"[\(\[]([^\)\]]*\bextended\b[^\)\]]*)[\)\]]", video_title or "", re.I)
+        label = found.group(1).strip() if found and len(found.group(1)) <= 40 else "Extended Mix"
+        return f"{base} ({label})"
+
+    def _rename_landed(self, path, title, sanitized_artists, track_num, track_id) -> str:
+        """Move a landed file to its real title under the same collision rules
+        as the first claim. Returns the path it ends up at."""
+        folder = os.path.dirname(path)
+        name = self._compose_filename(self.sanitize_text(title), sanitized_artists, track_num)
+        dest = os.path.join(folder, cap_filename(name))
+        with self._filename_lock:
+            if dest.casefold() in self._in_flight_files or self._file_belongs_to_other(
+                dest, track_id
+            ):
+                name = self._compose_filename(
+                    self.sanitize_text(title), sanitized_artists, track_num, disambig=track_id
+                )
+                dest = os.path.join(folder, cap_filename(name))
+            try:
+                os.replace(path, dest)
+            except OSError:
+                log.warning("could not rename %r to its real title", path, exc_info=True)
+                return path
+            self._in_flight_files.discard(path.casefold())
+            self._in_flight_files.add(dest.casefold())
+        return dest
+
+    def _note_landed(self, track_title, artists):
+        """Report what the landed pick means for this track, if anything."""
+        how, url, video_title = getattr(self._tls, "landed", None) or ("match", None, None)
+        if how == "loose":
+            self._note_report(
+                "check", track_title, artists, f'Closest result: "{video_title}"', url
+            )
+        elif (
+            self.prefer_extended
+            and how not in ("extended", "full")
+            and not self._is_extended_title(track_title)
+        ):
+            self._note_report("regular", track_title, artists, "No usable extended mix", url)
 
     def _get_user_friendly_error(self, error: Exception, track_title: str = "") -> str:
         """Convert exception to user-friendly error message."""
@@ -1059,6 +1158,176 @@ class MusicScraper(QThread):
             return target in yt
         return target in yt.split()
 
+    @classmethod
+    def _artist_tokens(cls, expected_artists: str | None) -> list[str]:
+        """Normalized artist names from Spotify's "A, B & C feat. D" string.
+        Splits on collaboration separators BEFORE normalizing - normalization
+        eats commas, which would collapse the multi-artist string into one
+        unmatchable token."""
+        if not expected_artists:
+            return []
+        raw_tokens = re.split(
+            r"[,&]+|\s+(?:feat\.?|ft\.?)\s+",
+            expected_artists,
+            flags=re.IGNORECASE,
+        )
+        return [t for t in (cls._normalize_title(t) for t in raw_tokens) if t]
+
+    # Words that mark a different recording than an extended mix.
+    # Each is only rejected when the Spotify title doesn't carry it itself, so
+    # a track that IS a remix can still get its extended remix.
+    _EXTENDED_REJECT_WORDS = (
+        "live",
+        "remix",
+        "cover",
+        "karaoke",
+        "instrumental",
+        "acapella",
+        "sped up",
+        "slowed",
+        "nightcore",
+        "reverb",
+        "8d",
+        "hour",
+        "loop",
+        "mashup",
+        "bootleg",
+    )
+
+    # An extended mix is longer than the radio edit, but not wildly so.
+    _EXTENDED_MIN_GAIN_S = 15
+    _EXTENDED_MAX_RATIO = 3.0
+    _EXTENDED_MAX_S = 20 * 60
+
+    # What Spotify calls a shortened cut. An artist-named edit, like "(Alesso
+    # Edit)", is its own version and stays out of this.
+    _EDIT_MARK = r"(?:radio edit|radio version|radio mix|single edit|single version|short edit|short version|edit)"
+    _EDIT_SUFFIX = re.compile(
+        rf"\s*(?:-\s*{_EDIT_MARK}\s*$|[\(\[]\s*{_EDIT_MARK}\s*[\)\]])", re.IGNORECASE
+    )
+    # In a full-length candidate these mean it's a cut or fragment, not the song.
+    _FULL_REJECT_WORDS = ("edit", "radio", "part", "snippet", "teaser")
+
+    @staticmethod
+    def _is_extended_title(title: str | None) -> bool:
+        return bool(title) and re.search(r"\bextended\b", title, re.IGNORECASE) is not None
+
+    def _select_extended_match(self, expected_title, expected_artists, expected_duration_s):
+        """Settings > Matching: the YouTube URL of the track's extended
+        mix, or None so the caller falls back to the regular match.
+
+        A candidate must carry the song title, one of the artists (in the
+        title or the channel name), the word "extended", none of the words
+        that mark a live/remix/cover/edit-for-tiktok upload, and a duration
+        that is longer than the Spotify track without being a 1-hour loop.
+        Official uploads win: YouTube's auto-generated "Artist - Topic"
+        channels (label-delivered audio) first, then the most viewed. With no
+        such upload, a radio edit may instead get its full-length version.
+        There is no way to prove an upload is official; this is a best-effort
+        filter, and the setting's hint says so.
+        """
+        if not expected_title or self._is_extended_title(expected_title):
+            # already the extended version on Spotify: the regular match finds it
+            return None
+        core = self._spotify_title_core(expected_title)
+        core = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", core)
+        core = re.sub(r"\s+", " ", core).strip()
+        if not core:
+            return None
+        query = f"ytsearch10:{core} {expected_artists or ''} extended mix".replace("  ", " ")
+        select_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": True,
+            "ignoreerrors": True,
+            "retries": 5,
+            "socket_timeout": 15,
+        }
+        try:
+            with self._youtube(select_opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+        except Exception as exc:
+            log.warning("extended search raised %s: %s", type(exc).__name__, str(exc)[:300])
+            return None
+        entries = [e for e in (info or {}).get("entries", []) if e and e.get("id")]
+
+        # raw lowercased titles, not _normalize_title: it drops the
+        # parentheses that "(Remix)" and "(Live)" live in
+        spotify_raw = expected_title.lower()
+        rejects = [
+            w
+            for w in self._EXTENDED_REJECT_WORDS
+            if not re.search(rf"\b{re.escape(w)}\b", spotify_raw)
+        ]
+        artists = self._artist_tokens(expected_artists)
+
+        def acceptable(entry) -> bool:
+            title = entry.get("title") or ""
+            if not self._is_extended_title(title):
+                return False
+            if not self._title_plausibly_matches(title, expected_title):
+                return False
+            raw = title.lower()
+            if any(re.search(rf"\b{re.escape(w)}\b", raw) for w in rejects):
+                return False
+            if artists:
+                where = self._normalize_title(
+                    f"{title} {entry.get('channel') or ''} {entry.get('uploader') or ''}"
+                )
+                if not any(a in where for a in artists):
+                    return False
+            duration = entry.get("duration")
+            if not duration:
+                return False  # can't tell an extended mix from a radio edit
+            if expected_duration_s:
+                if duration < expected_duration_s + self._EXTENDED_MIN_GAIN_S:
+                    return False
+                if duration > expected_duration_s * self._EXTENDED_MAX_RATIO:
+                    return False
+            return duration <= self._EXTENDED_MAX_S
+
+        def full_length(entry) -> bool:
+            """The long cut of a radio edit often has no "extended" in its title
+            (it's just the song), so with no such word the upload must come from
+            the artist's own channel."""
+            title = entry.get("title") or ""
+            duration = entry.get("duration")
+            if not duration or not expected_duration_s:
+                return False
+            if not self._title_plausibly_matches(title, expected_title):
+                return False
+            raw = title.lower()
+            words = [*rejects, *self._FULL_REJECT_WORDS]
+            if any(re.search(rf"\b{re.escape(w)}\b", raw) for w in words):
+                return False
+            channel = self._normalize_title(entry.get("channel") or entry.get("uploader") or "")
+            if not any(a in channel for a in artists):
+                return False
+            return (
+                expected_duration_s + self._EXTENDED_MIN_GAIN_S
+                <= duration
+                <= min(expected_duration_s * self._EXTENDED_MAX_RATIO, self._EXTENDED_MAX_S)
+            )
+
+        how = "extended"
+        pool = [e for e in entries if acceptable(e)]
+        if not pool and self._EDIT_SUFFIX.search(expected_title):
+            how = "full"
+            pool = [e for e in entries if full_length(e)]
+        if not pool:
+            log.info("no extended mix found for %r, using the regular version", expected_title)
+            return None
+
+        def rank(entry):
+            channel = entry.get("channel") or entry.get("uploader") or ""
+            return (channel.endswith(" - Topic"), entry.get("view_count") or 0)
+
+        chosen = max(pool, key=rank)
+        log.info("extended mix for %r: %s (%r)", expected_title, chosen["id"], chosen.get("title"))
+        self._tls.pick = (how, chosen.get("title"))
+        return f"https://www.youtube.com/watch?v={chosen['id']}"
+
     def _select_youtube_match(
         self, search_query, expected_duration_s, expected_title=None, expected_artists=None
     ):
@@ -1147,16 +1416,7 @@ class MusicScraper(QThread):
             # over wrong audio (#52). Title-only when no artists are known.
             pool = title_ok
             if expected_artists:
-                # Split on collaboration separators BEFORE normalizing -
-                # normalization eats commas, which would collapse the
-                # multi-artist string into one unmatchable token.
-                raw_tokens = re.split(
-                    r"[,&]+|\s+(?:feat\.?|ft\.?)\s+",
-                    expected_artists,
-                    flags=re.IGNORECASE,
-                )
-                artist_tokens = [self._normalize_title(t) for t in raw_tokens]
-                artist_tokens = [t for t in artist_tokens if t]
+                artist_tokens = self._artist_tokens(expected_artists)
                 if artist_tokens:
                     pool = [
                         e
@@ -1235,6 +1495,7 @@ class MusicScraper(QThread):
             if timed:
                 chosen = min(timed, key=lambda e: abs(e["duration"] - expected_duration_s))
         log.warning("loose match (no confident title/artist match): selected %s", chosen["id"])
+        self._tls.pick = ("loose", chosen.get("title"))
         return f"https://www.youtube.com/watch?v={chosen['id']}"
 
     def download_track_audio(
@@ -1244,7 +1505,14 @@ class MusicScraper(QThread):
         expected_duration_s=None,
         expected_title=None,
         expected_artists=None,
+        track_title=None,
+        track_artists=None,
     ):
+        """Download the best YouTube match for a track to `destination`.
+
+        expected_title/expected_artists turn on strict matching. track_title/
+        track_artists only feed the extended-mix search, for callers that
+        keep the legacy matcher (the single-track path)."""
         # Check for FFmpeg first
         ffmpeg_path = get_ffmpeg_path()
         if not ffmpeg_path:
@@ -1305,15 +1573,33 @@ class MusicScraper(QThread):
             fallback_opts["extractor_args"] = {"youtube": {"player_client": list(retry_clients)}}
         attempts = [("default", ydl_opts), ("fallback", fallback_opts)]
 
-        for query in queries:
-            video_url = self._select_youtube_match(
-                query,
-                expected_duration_s,
-                expected_title=expected_title,
-                expected_artists=expected_artists,
-            )
-            if not video_url:
-                continue
+        def candidate_urls():
+            # (url, how it was picked, youtube title); extended mix first when
+            # asked for, and a failed download of it falls through to the
+            # regular match like any other unplayable result
+            extended = None
+            if self.prefer_extended:
+                self._tls.pick = None
+                extended = self._select_extended_match(
+                    expected_title or track_title,
+                    expected_artists or track_artists,
+                    expected_duration_s,
+                )
+                if extended:
+                    yield (extended, *(self._tls.pick or ("extended", None)))
+            for query in queries:
+                self._tls.pick = None
+                url = self._select_youtube_match(
+                    query,
+                    expected_duration_s,
+                    expected_title=expected_title,
+                    expected_artists=expected_artists,
+                )
+                if url and url != extended:
+                    yield (url, *(self._tls.pick or ("match", None)))
+
+        self._tls.landed = None
+        for video_url, how, video_title in candidate_urls():
             for label, opts in attempts:
                 # per-attempt bridge captures yt-dlp's own error even when
                 # ignoreerrors swallows it (no exception, no file)
@@ -1344,6 +1630,7 @@ class MusicScraper(QThread):
                 if os.path.exists(expected_path):
                     if label != "default":
                         log.info("recovered via %s player clients", label)
+                    self._tls.landed = (how, video_url, video_title)
                     return expected_path
 
         log.debug("no playable audio landed for query set %r", queries)
@@ -1480,6 +1767,9 @@ class MusicScraper(QThread):
                 log.debug("track failure traceback for '%s'", track_title, exc_info=True)
                 with self._failed_lock:
                     self._failed_tracks.append(track_title)
+                self._note_report(
+                    "failed", track_title, artists, self._failure_reason(error_status)
+                )
                 self._finish_track_ui(ok=False)
                 return track_title
 
@@ -1491,9 +1781,18 @@ class MusicScraper(QThread):
                 )
                 with self._failed_lock:
                     self._failed_tracks.append(track_title)
+                self._note_report("failed", track_title, artists, self._failure_reason(None))
                 self._finish_track_ui(ok=False)
                 return track_title
 
+            self._note_landed(track_title, artists)
+            real_title = self._landed_title(track_title)
+            if real_title != track_title:
+                song_meta["title"] = real_title
+                final_path = self._rename_landed(
+                    final_path, real_title, sanitized_artists, track_num, track.id
+                )
+                filepath = final_path  # the claim moved with the file
             self._record_in_manifest(track.id, final_path)
             song_meta["file"] = final_path
             self.add_song_meta.emit(song_meta)
@@ -1589,6 +1888,9 @@ class MusicScraper(QThread):
             self.counter = 0
         with self._failed_lock:
             self._failed_tracks.clear()
+            self._report.clear()
+        self._report_name = ""
+        self._report_folder = ""
         with self._filename_lock:
             self._in_flight_files.clear()
         self._parallel_mode = False
@@ -1617,6 +1919,8 @@ class MusicScraper(QThread):
         self.song_Album.emit(playlist_display_name)
 
         playlist_folder_path = self.prepare_playlist_folder(music_folder, playlist_display_name)
+        self._report_name = playlist_display_name
+        self._report_folder = playlist_folder_path
         with folder_lock(playlist_folder_path):
             # Resume support: skip tracks already downloaded in a previous run of
             # this folder before fetching their (rate-limited) metadata, so a huge
@@ -1625,7 +1929,7 @@ class MusicScraper(QThread):
             if already_done:
                 self.resume_skipped.emit(len(already_done))
                 self.error_signal.emit(
-                    f"Resuming: skipping {len(already_done)} already-downloaded track(s)"
+                    f"Resuming: skipping {_counted(len(already_done), 'downloaded track')}"
                 )
 
             # Materialize the generator (not thread-safe; count also picks the
@@ -1736,10 +2040,12 @@ class MusicScraper(QThread):
             if self._failed_tracks:
                 log.info("scrape done: %d ok, %d failed", ok, len(self._failed_tracks))
                 log.info("failed tracks: %s", " | ".join(self._failed_tracks))
-                self.PlaylistCompleted.emit(f"Done! {len(self._failed_tracks)} track(s) failed")
+                self.PlaylistCompleted.emit(
+                    f"Done, {_counted(len(self._failed_tracks), 'track')} failed"
+                )
             else:
                 log.info("scrape done: %d ok, 0 failed", self._total_tracks)
-                self.PlaylistCompleted.emit("Download Complete!")
+                self.PlaylistCompleted.emit("Download complete")
 
     def returnSPOT_ID(self, link):
         """Extract playlist ID from Spotify URL."""
@@ -1798,7 +2104,7 @@ class MusicScraper(QThread):
         if os.path.exists(filepath):
             self.add_song_meta.emit(song_meta)
             self.increment_counter()
-            self.PlaylistCompleted.emit("Track already exists!")
+            self.PlaylistCompleted.emit("Track already exists")
             return
 
         # Download via YouTube search
@@ -1806,7 +2112,11 @@ class MusicScraper(QThread):
         expected_dur = (track.duration_ms / 1000) if track.duration_ms else None
         try:
             final_path = self.download_track_audio(
-                search_query, filepath, expected_duration_s=expected_dur
+                search_query,
+                filepath,
+                expected_duration_s=expected_dur,
+                track_title=track_title,
+                track_artists=artists,
             )
         except Exception as error_status:
             error_msg = self._get_user_friendly_error(error_status, track_title)
@@ -1825,11 +2135,15 @@ class MusicScraper(QThread):
             self.PlaylistCompleted.emit("Download failed - no audio file produced")
             return
 
+        real_title = self._landed_title(track_title)
+        if real_title != track_title:
+            song_meta["title"] = real_title
+            final_path = self._rename_landed(final_path, real_title, sanitized_artists, None, None)
         song_meta["file"] = final_path
         self.add_song_meta.emit(song_meta)
         self.increment_counter()
         self.dlprogress_signal.emit(100)
-        self.PlaylistCompleted.emit("Download Complete!")
+        self.PlaylistCompleted.emit("Download complete")
 
     def increment_counter(self):
         with self._counter_lock:
@@ -1861,7 +2175,7 @@ class ScraperThread(QThread):
         self._cancel_event.set()
 
     def run(self):
-        self.progress_update.emit("Scraping started...")
+        self.progress_update.emit("Starting")
         try:
             # Detect URL type and handle accordingly
             url_type, _ = detect_spotify_url_type(self.spotify_link)
@@ -2059,13 +2373,17 @@ class DownloadThumbnail(QThread):
             return
         try:
             response = requests.get(self.url, stream=True, timeout=10)
-            if response.status_code == 200:
-                self.thumbnail_ready.emit(response.content)
+            # no image clears the preview, so it can't keep the last song's cover
+            self.thumbnail_ready.emit(response.content if response.status_code == 200 else b"")
         except Exception as exc:
             log.debug("thumbnail fetch failed: %s", exc)
+            self.thumbnail_ready.emit(b"")
 
     def _update_ui(self, data):
         """Update UI from main thread via signal."""
+        # workers overlap: an older track's cover can arrive after the current one's
+        if self.url != self.main_UI._preview_cover_url:
+            return
         pic = QImage()
         pic.loadFromData(data)
         self.main_UI.CoverImg.setPixmap(QPixmap(pic))
@@ -2090,15 +2408,15 @@ class SettingsDialog(QDialog):
         self._folder_label = QLineEdit(self._config.get("download_path") or "(not set)")
         self._folder_label.setReadOnly(True)
         self._folder_label.setFrame(False)
+        # QLineEdit pads its text 2px; pull it back onto the row's left edge
+        self._folder_label.setTextMargins(-2, 0, 0, 0)
         self._folder_label.setCursorPosition(0)
         self._folder_label.setToolTip(self._folder_label.text())
-        self._folder_label.setStyleSheet("QLineEdit { background: transparent; padding: 0; }")
-        browse = QPushButton("Choose folder")
+        self._folder_label.setStyleSheet(
+            "QLineEdit { background: transparent; padding: 0; font-size: 12px; }"
+        )
+        browse = QPushButton("Choose...")
         browse.clicked.connect(self._choose_folder)
-
-        folder_row = QHBoxLayout()
-        folder_row.addWidget(self._folder_label, 1)
-        folder_row.addWidget(browse)
 
         self._format_cb = QComboBox()
         for key in SUPPORTED_FORMATS:
@@ -2112,7 +2430,7 @@ class SettingsDialog(QDialog):
         current_q = self._config.get("quality", "192")
         self._quality_cb.setCurrentText(f"{current_q} kbps")
 
-        self._include_track_number_cb = QCheckBox()
+        self._include_track_number_cb = ToggleSwitch()
         self._include_track_number_cb.setChecked(self._config.get("include_track_number", False))
 
         # the three naming shapes are mutually exclusive, so they present as
@@ -2144,113 +2462,145 @@ class SettingsDialog(QDialog):
             current_sr = "auto"
         self._sample_rate_cb.setCurrentText(self._sample_rate_labels[current_sr])
 
-        self._loose_match_cb = QCheckBox()
+        self._loose_match_cb = ToggleSwitch()
         self._loose_match_cb.setChecked(self._config.get("loose_match", False))
+
+        self._prefer_extended_cb = ToggleSwitch()
+        self._prefer_extended_cb.setChecked(self._config.get("prefer_extended", False))
 
         # initial enable/disable sync needs every dependent combo to exist
         self._on_format_change(self._format_cb.currentText())
         self._update_filename_preview()
 
-        # Each setting owns its height as a QFrame+QVBoxLayout block:
-        # QFormLayout computes row height from the label column and clips
-        # word-wrapped hints, this lets every hint take the lines it needs.
-        from PyQt6.QtGui import QFontMetrics, QPalette
-        from PyQt6.QtWidgets import QFrame, QSizePolicy
+        from PyQt6.QtGui import QPalette
+        from PyQt6.QtWidgets import QFrame, QScrollArea, QSizePolicy, QWidget
 
-        # one list so the label column is measured from the longest label, not a magic width
-        _settings = [
+        # Grouped panels of rows, each row: name + hint on the left, control
+        # on the right. Everything shares one left edge, so no label column
+        # sized by the longest name. Rows are QFrame+QHBoxLayout blocks rather
+        # than a QFormLayout, which clips word-wrapped hints.
+        _groups = [
             (
-                "Download folder:",
-                folder_row,
-                "Each playlist or album becomes its own folder inside this directory.",
+                "Output",
+                [
+                    (
+                        "Download folder",
+                        browse,
+                        "Each playlist or album gets its own folder inside it.",
+                        self._folder_label,
+                    ),
+                    (
+                        "Audio format",
+                        self._format_cb,
+                        "mp3 plays everywhere. m4a is smaller at the same quality. "
+                        "flac and wav lose nothing further, at a much larger size.",
+                    ),
+                    (
+                        "Audio quality",
+                        self._quality_cb,
+                        "mp3, m4a and opus only. YouTube's source is ~128 kbps: higher "
+                        "settings lose less of it but can't add to it.",
+                    ),
+                    (
+                        "Sample rate",
+                        self._sample_rate_cb,
+                        "auto keeps YouTube's 48 kHz; 44.1 kHz suits CDs and older "
+                        "players. mp3, flac and wav only.",
+                    ),
+                ],
             ),
             (
-                "Audio format:",
-                self._format_cb,
-                "mp3 plays everywhere. m4a is smaller at the same quality. "
-                "flac and wav keep the source audio with nothing further lost (much larger files).",
+                "File names",
+                [
+                    (
+                        "Track number",
+                        self._include_track_number_cb,
+                        'Adds "01. " so files sort in playlist order.',
+                    ),
+                    (
+                        "Filename style",
+                        self._filename_style_cb,
+                        '"Song only" still writes every tag; songs with the same title '
+                        "get a short id instead of overwriting. Files already on disk "
+                        "keep their names.",
+                    ),
+                    ("Preview", self._filename_preview, ""),
+                ],
             ),
             (
-                "Audio quality:",
-                self._quality_cb,
-                "Applies to mp3, m4a and opus. The source is YouTube's ~128 kbps audio, "
-                "so higher settings lose less of it but can't add to it.",
-            ),
-            (
-                "Track number in filename:",
-                self._include_track_number_cb,
-                'Off → "Song - Artist.mp3".   On → "01. Song - Artist.mp3".   '
-                "Files sort in playlist order in your file manager.",
-            ),
-            (
-                "Filename style:",
-                self._filename_style_cb,
-                '"Song only" keeps the artist out of the filename; every tag '
-                "(artist, album, art) is still written, and two different songs "
-                "with the same title get a short id suffix instead of "
-                "overwriting each other. Applies to new downloads; files "
-                "already on disk keep their names.",
-            ),
-            (
-                "Filename preview:",
-                self._filename_preview,
-                "",
-            ),
-            (
-                "Sample rate:",
-                self._sample_rate_cb,
-                "auto keeps the source rate (YouTube audio is 48 kHz). "
-                "44.1 kHz matches CDs and older players. "
-                "Applies to mp3, flac and wav; opus and m4a keep their source rate.",
-            ),
-            (
-                "Use closest result if no match:",
-                self._loose_match_cb,
-                "Off (default): skips a track rather than risk the wrong audio. "
-                "On: falls back to the closest result by length, which recovers "
-                "songs whose YouTube title is in another script (Greek, Cyrillic, "
-                "Korean) but may let an occasional cover or remix slip through.",
+                "Matching",
+                [
+                    (
+                        "Use closest result if no match",
+                        self._loose_match_cb,
+                        "Off skips a track rather than risk the wrong audio. On takes the "
+                        "closest length, which recovers titles in other scripts (Greek, "
+                        "Cyrillic, Korean) but can let a cover or remix through.",
+                    ),
+                    (
+                        "Prefer extended mixes",
+                        self._prefer_extended_cb,
+                        "Tries each song's extended mix first (official channel, then most "
+                        "viewed) and, for a radio edit, the artist's full-length upload. "
+                        "Falls back to the normal version. Nothing proves an upload is "
+                        "official, so give the files a listen.",
+                    ),
+                ],
             ),
         ]
-        _fm = QFontMetrics(self.font())
-        LABEL_W = max(_fm.horizontalAdvance(lbl) for lbl, _, _ in _settings) + 8
 
-        # muted palette text so hints stay readable on light (win/linux) and dark (mac) themes
+        tints = _palette_tints(self)
         _fg = self.palette().color(QPalette.ColorRole.WindowText)
-        _hint_color = f"rgba({_fg.red()}, {_fg.green()}, {_fg.blue()}, 175)"
+        for switch in (
+            self._include_track_number_cb,
+            self._loose_match_cb,
+            self._prefer_extended_cb,
+        ):
+            switch.set_colors(
+                off=QColor(_fg.red(), _fg.green(), _fg.blue(), 70),
+                ring=QColor(_fg.red(), _fg.green(), _fg.blue(), 0),
+                focus=QColor(_fg.red(), _fg.green(), _fg.blue(), 120),
+            )
+        for combo in (
+            self._format_cb,
+            self._quality_cb,
+            self._sample_rate_cb,
+            self._filename_style_cb,
+        ):
+            combo.setFixedWidth(180)
 
-        def _setting_block(label_text: str, control, hint_text: str) -> QFrame:
+        def _setting_row(title: str, control, hint_text: str, extra=None) -> QFrame:
             container = QFrame()
-            box = QVBoxLayout(container)
-            box.setSpacing(4)
-            box.setContentsMargins(0, 0, 0, 12)  # visual gap between settings
-
-            # Top row: label + control side-by-side, label fixed-width so all
-            # the controls in different blocks line up vertically.
-            row = QHBoxLayout()
-            row.setSpacing(10)
-            row.setContentsMargins(0, 0, 0, 0)
-            name = QLabel(label_text)
-            name.setMinimumWidth(LABEL_W)
-            name.setMaximumWidth(LABEL_W)
-            name.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            row.addWidget(name)
-            if isinstance(control, QHBoxLayout):
-                row.addLayout(control, 1)
-            else:
-                row.addWidget(control, 1)
-            box.addLayout(row)
-
-            # Hint below, indented to start under the control column so it
-            # visually associates with the control rather than the label.
+            row = QHBoxLayout(container)
+            row.setContentsMargins(16, 12, 16, 12)
+            row.setSpacing(16)
+            text = QVBoxLayout()
+            text.setSpacing(4)
+            name = QLabel(title)
+            name.setStyleSheet("font-weight: 500;")
+            text.addWidget(name)
+            if extra is not None:
+                text.addWidget(extra)
             if hint_text:
                 hint = QLabel(hint_text)
                 hint.setWordWrap(True)
-                hint.setStyleSheet(f"color: {_hint_color}; font-size: 11px;")
-                hint.setContentsMargins(LABEL_W + 12, 2, 4, 0)
+                hint.setStyleSheet(f"color: {tints['hint']}; font-size: 11px;")
                 hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-                box.addWidget(hint)
+                text.addWidget(hint)
+            row.addLayout(text, 1)
+            row.addWidget(control, 0, Qt.AlignmentFlag.AlignVCenter)
             return container
+
+        def _group(title: str, settings: list, first: bool) -> QWidget:
+            host = QWidget()
+            box = QVBoxLayout(host)
+            box.setContentsMargins(0, 0 if first else 24, 0, 0)
+            box.setSpacing(8)
+            name = QLabel(title)
+            name.setStyleSheet("font-size: 14px; font-weight: 600;")
+            box.addWidget(name)
+            box.addWidget(_rounded_panel([_setting_row(*row) for row in settings], tints))
+            return host
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -2263,14 +2613,12 @@ class SettingsDialog(QDialog):
         open_logs.setToolTip(log_file_path())
         open_logs.clicked.connect(self._open_logs)
 
-        from PyQt6.QtWidgets import QScrollArea, QWidget
-
         rows_host = QWidget()
         rows = QVBoxLayout(rows_host)
         rows.setSpacing(0)
-        rows.setContentsMargins(0, 0, 0, 0)
-        for _label, _control, _hint in _settings:
-            rows.addWidget(_setting_block(_label, _control, _hint))
+        rows.setContentsMargins(4, 4, 4, 8)
+        for index, (title, settings) in enumerate(_groups):
+            rows.addWidget(_group(title, settings, first=index == 0))
         rows.addStretch(1)
 
         # settings scroll when the screen can't fit them (small laptops,
@@ -2365,279 +2713,363 @@ class SettingsDialog(QDialog):
         label_to_value = {v: k for k, v in self._sample_rate_labels.items()}
         self._config["sample_rate"] = label_to_value.get(self._sample_rate_cb.currentText(), "auto")
         self._config["loose_match"] = self._loose_match_cb.isChecked()
+        self._config["prefer_extended"] = self._prefer_extended_cb.isChecked()
         return self._config
 
 
-class UpdateNotifier(QDialog):
-    """Toast-style 'new version available' card. Static copy, dynamic versions,
-    so there's no per-release content to maintain. Download opens the releases
-    page (where the auto-generated changelog already lives)."""
+def _palette_tints(widget) -> dict:
+    """rgba() strings derived from the widget's text color, so plain dialogs
+    read on light (win/linux) and dark (mac) themes alike."""
+    from PyQt6.QtGui import QPalette
 
-    def __init__(self, parent, current: str, latest: str, url: str):
+    fg = widget.palette().color(QPalette.ColorRole.WindowText)
+    rgb = f"{fg.red()}, {fg.green()}, {fg.blue()}"
+    return {
+        "hint": f"rgba({rgb}, 165)",
+        "panel": f"rgba({rgb}, 12)",
+        "rule": f"rgba({rgb}, 28)",
+    }
+
+
+def _rounded_panel(rows: list, tints: dict):
+    """Rows in one rounded panel, hairlines between them."""
+    from PyQt6.QtWidgets import QFrame
+
+    panel = QFrame()
+    panel.setObjectName("roundedPanel")
+    panel.setStyleSheet(
+        f"QFrame#roundedPanel {{ background-color: {tints['panel']}; border-radius: 12px; }}"
+    )
+    inner = QVBoxLayout(panel)
+    inner.setContentsMargins(0, 0, 0, 0)
+    inner.setSpacing(0)
+    for index, row in enumerate(rows):
+        if index:
+            rule = QFrame()
+            rule.setFixedHeight(1)
+            rule.setStyleSheet(f"background-color: {tints['rule']}; margin: 0 16px;")
+            inner.addWidget(rule)
+        inner.addWidget(row)
+    return panel
+
+
+# report sections: kind -> (title, one-line explanation)
+REPORT_SECTIONS = {
+    "failed": (
+        "Not downloaded",
+        "These are not in the folder. Running the same link again retries only these.",
+    ),
+    "check": (
+        "Check these",
+        "Downloaded from the closest YouTube result, which may be a cover or the wrong song.",
+    ),
+    "regular": (
+        "Normal version used",
+        "No extended mix turned up, so the regular version was downloaded.",
+    ),
+}
+
+
+def report_summary(report: dict) -> str:
+    """ "21 of 24 downloaded · 3 failed · 2 to check" for the dialog and button."""
+    entries = report.get("entries", [])
+    failed = sum(1 for e in entries if e["kind"] == "failed")
+    check = sum(1 for e in entries if e["kind"] == "check")
+    regular = sum(1 for e in entries if e["kind"] == "regular")
+    total = report.get("total") or 0
+    parts = [f"{max(total - failed, 0)} of {total} downloaded" if total else ""]
+    if failed:
+        parts.append(f"{failed} failed")
+    if check:
+        parts.append(f"{check} to check")
+    if regular:
+        parts.append(f"{regular} not extended")
+    return " · ".join(p for p in parts if p)
+
+
+def report_text(report: dict) -> str:
+    """Plain-text copy of the report, for the clipboard."""
+    lines = [report.get("name") or "Sunnify download", report_summary(report)]
+    for kind, (title, _hint) in REPORT_SECTIONS.items():
+        rows = [e for e in report.get("entries", []) if e["kind"] == kind]
+        if not rows:
+            continue
+        lines += ["", f"{title} ({len(rows)})"]
+        for e in rows:
+            line = f"- {e['title']} · {e['artists']}: {e['detail']}"
+            if e.get("url"):
+                line += f" ({e['url']})"
+            lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+class RunReportDialog(QDialog):
+    """End-of-run report: what didn't download, and what to double-check.
+    Non-modal, so a queued download carries on underneath it."""
+
+    def __init__(self, parent, report: dict):
         super().__init__(parent)
-        from PyQt6.QtGui import QColor, QFont, QFontMetrics
-        from PyQt6.QtWidgets import QFrame, QLabel, QWidget
+        from PyQt6.QtWidgets import QFrame, QLabel, QScrollArea, QWidget
 
-        self._url = url
-        self.setWindowTitle("Update available")
+        self.setWindowTitle("Download report")
+        self.setModal(False)
+        self.setMinimumWidth(520)
+        self._report = report
+        tints = _palette_tints(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(4)
+        name = QLabel(report.get("name") or "Download")
+        name.setTextFormat(Qt.TextFormat.PlainText)
+        name.setStyleSheet("font-size: 16px; font-weight: 600;")
+        layout.addWidget(name)
+        self._summary = QLabel(report_summary(report))
+        self._summary.setStyleSheet(f"color: {tints['hint']};")
+        layout.addWidget(self._summary)
+        layout.addSpacing(12)
+
+        host = QWidget()
+        rows = QVBoxLayout(host)
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setSpacing(24)
+        if report.get("network_blocked"):
+            banner = QLabel(
+                "YouTube asked this network to prove it isn't a bot, so most downloads "
+                "were refused. That check is on your IP, not on Sunnify: try another "
+                "network, wait a few hours, or add YouTube cookies in Settings."
+            )
+            banner.setWordWrap(True)
+            banner.setStyleSheet(
+                "background-color: rgba(226, 52, 88, 0.12); color: palette(window-text);"
+                "border-radius: 12px; padding: 12px 16px;"
+            )
+            rows.addWidget(banner)
+
+        for kind, (title, hint) in REPORT_SECTIONS.items():
+            entries = [e for e in report.get("entries", []) if e["kind"] == kind]
+            if not entries:
+                continue
+            group = QVBoxLayout()
+            group.setSpacing(4)
+            header = QLabel(f"{title} ({len(entries)})")
+            header.setStyleSheet("font-size: 14px; font-weight: 600;")
+            group.addWidget(header)
+            explain = QLabel(hint)
+            explain.setWordWrap(True)
+            explain.setStyleSheet(f"color: {tints['hint']}; font-size: 11px;")
+            group.addWidget(explain)
+            group.addSpacing(4)
+            group.addWidget(_rounded_panel([self._row(e, tints) for e in entries], tints))
+            rows.addLayout(group)
+        rows.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(host)
+        layout.addWidget(scroll, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.close)
+        copy = btns.addButton("Copy list", QDialogButtonBox.ButtonRole.ActionRole)
+        copy.clicked.connect(self._copy)
+        if report.get("folder"):
+            folder = btns.addButton("Open folder", QDialogButtonBox.ButtonRole.ActionRole)
+            folder.clicked.connect(self._open_folder)
+        layout.addSpacing(8)
+        layout.addWidget(btns)
+
+        host.adjustSize()
+        screen = self.screen() or QApplication.primaryScreen()
+        height = host.sizeHint().height() + 150
+        if screen is not None:
+            height = min(height, int(screen.availableGeometry().height() * 0.8))
+        self.resize(560, max(height, 260))
+
+    @staticmethod
+    def _row(entry, tints):
+        from PyQt6.QtWidgets import QFrame, QLabel, QSizePolicy
+
+        container = QFrame()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(16, 12, 16, 12)
+        row.setSpacing(12)
+        text = QVBoxLayout()
+        text.setSpacing(4)
+        title = QLabel(entry["title"])
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setStyleSheet("font-weight: 500;")
+        text.addWidget(title)
+        detail = QLabel(" · ".join(p for p in (entry.get("artists"), entry.get("detail")) if p))
+        detail.setTextFormat(Qt.TextFormat.PlainText)
+        detail.setWordWrap(True)
+        detail.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        detail.setStyleSheet(f"color: {tints['hint']}; font-size: 12px;")
+        text.addWidget(detail)
+        row.addLayout(text, 1)
+        if entry.get("url") and entry["kind"] != "failed":
+            listen = QPushButton("Open")
+            listen.setToolTip(entry["url"])
+            listen.clicked.connect(lambda _=False, url=entry["url"]: webbrowser.open(url))
+            row.addWidget(listen, 0, Qt.AlignmentFlag.AlignVCenter)
+        return container
+
+    def _copy(self):
+        QApplication.clipboard().setText(report_text(self._report))
+        self._summary.setText(report_summary(self._report) + " · copied")
+
+    def _open_folder(self):
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self._report["folder"]))
+
+
+class _ToastCard(QDialog):
+    """Frameless card shared by the update and star notices. Sizes are px in
+    qss with no font family, like the main window, so it uses the OS font."""
+
+    def __init__(self, parent, window_title, eyebrow, title, body, dismiss, action, on_action):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QFrame, QLabel
+
+        self.setWindowTitle(window_title)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        # no OS shadow: macOS would trace a hard outline around our soft one
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
         self.setModal(True)
-        self.setFont(QFont("Arial", 10))
 
-        green, green_hover = "#1ED760", "#1FE968"
-        cyan, purple = "rgba(80, 214, 255, 255)", "rgba(112, 32, 213, 255)"
-        ink, mute = "#15151F", "#7A7A8C"
-
+        ink, mute = "#15151F", "#5E5E70"
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(28, 26, 28, 30)  # room for the drop shadow
+        outer.setContentsMargins(28, 24, 28, 32)  # room for the drop shadow
         # fractional dpi under-measures the wrapped body and squeezes the card (#64)
         outer.setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)
 
         card = QFrame()
         card.setObjectName("card")
-        card.setFixedWidth(430)
-        card.setStyleSheet("QFrame#card{background:#FFFFFF;border-radius:18px;}")
+        card.setFixedWidth(432)
+        card.setStyleSheet("QFrame#card{background:#FFFFFF;border-radius:16px;}")
         shadow = QGraphicsDropShadowEffect(blurRadius=48, xOffset=0, yOffset=16)
         shadow.setColor(QColor(20, 10, 40, 110))
         card.setGraphicsEffect(shadow)
         outer.addWidget(card)
 
         v = QVBoxLayout(card)
-        v.setContentsMargins(0, 0, 0, 0)
+        v.setContentsMargins(24, 24, 24, 20)
         v.setSpacing(0)
-
-        header = QFrame()
-        header.setObjectName("hdr")
-        header.setStyleSheet(
-            "QFrame#hdr{border-top-left-radius:18px;border-top-right-radius:18px;"
-            f"background:qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1,"
-            f"stop:0.23 {cyan}, stop:0.81 {purple});}}"
-        )
-        hv = QVBoxLayout(header)
-        hv.setContentsMargins(26, 20, 26, 22)
-        hv.setSpacing(0)  # gaps are set explicitly between rows below
-
-        eyebrow = QLabel("UPDATE AVAILABLE")
-        ef = QFont("Arial", 9, QFont.Weight.Bold)
-        ef.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
-        eyebrow.setFont(ef)
-        eyebrow.setStyleSheet("color: rgba(255,255,255,0.85);")
-        hv.addWidget(eyebrow)
-        hv.addSpacing(8)
-
-        name = QLabel("Sunnify")
-        nfont = QFont("Arial", 22, QFont.Weight.Bold)
-        name.setFont(nfont)
-        name.setStyleSheet("color: #FFFFFF;")
-        # large bold glyphs exceed QLabel's tight default box; reserve full height
-        name.setMinimumHeight(QFontMetrics(nfont).height() + 10)
-        hv.addWidget(name)
-        hv.addSpacing(10)  # clear gap so the 'y' descender never crowds the version line
-
-        # current -> new, read left to right; new version brighter/bold to draw the eye
-        prog = QLabel(
-            f'<span style="color:rgba(255,255,255,0.8)">{current}</span>'
-            "&nbsp;&nbsp;&#8594;&nbsp;&nbsp;"
-            f'<span style="color:#FFFFFF;font-weight:bold">{latest}</span>'
-        )
-        pfont = QFont("Arial", 13)
-        prog.setFont(pfont)
-        prog.setMinimumHeight(QFontMetrics(pfont).height() + 6)
-        hv.addWidget(prog)
-        v.addWidget(header)
-
-        body = QWidget()
-        bv = QVBoxLayout(body)
-        bv.setContentsMargins(26, 22, 26, 6)
-        msg = QLabel(
-            "A newer version of Sunnify is available. Download it from the "
-            "releases page to get the latest fixes and improvements."
-        )
+        small = QLabel(eyebrow)
+        small.setStyleSheet(f"color:{mute};font-size:12px;")
+        v.addWidget(small)
+        v.addSpacing(4)
+        name = QLabel(title)
+        name.setStyleSheet(f"color:{ink};font-size:20px;font-weight:600;")
+        v.addWidget(name)
+        v.addSpacing(12)
+        msg = QLabel(body)
         msg.setWordWrap(True)
-        msg.setFont(QFont("Arial", 10))
-        msg.setStyleSheet(f"color: {mute};")
-        bv.addWidget(msg)
-        v.addWidget(body)
+        msg.setStyleSheet(f"color:{mute};font-size:13px;")
+        v.addWidget(msg)
+        v.addSpacing(20)
 
-        footer = QWidget()
-        fv = QHBoxLayout(footer)
-        fv.setContentsMargins(26, 8, 26, 22)
-        fv.setSpacing(10)
-
-        later = QPushButton("Remind me later")
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
+        later = QPushButton(dismiss)
         later.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        later.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         later.setFixedHeight(40)
         later.setStyleSheet(
-            f"QPushButton{{background:transparent;color:{mute};border:none;}}"
+            f"QPushButton{{background:transparent;color:{mute};border:none;"
+            "font-size:13px;font-weight:500;text-align:left;}"
             f"QPushButton:hover{{color:{ink};}}"
         )
         later.clicked.connect(self.reject)
-        fv.addWidget(later)
-        fv.addStretch(1)
-
-        download = QPushButton("Download")
-        download.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        download.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        download.setFixedSize(132, 40)
-        download.setStyleSheet(
-            f"QPushButton{{background:{green};color:white;border-radius:10px;}}"
-            f"QPushButton:hover{{background:{green_hover};}}"
+        footer.addWidget(later)
+        footer.addStretch(1)
+        go = QPushButton(action)
+        go.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        go.setFixedHeight(40)
+        go.setStyleSheet(
+            "QPushButton{background:#1ED760;color:#06240F;border:none;border-radius:10px;"
+            "font-size:13px;font-weight:600;padding:0 20px;}"
+            "QPushButton:hover{background:#3BE477;}"
         )
-        download.clicked.connect(self._open_releases)
-        fv.addWidget(download)
-        v.addWidget(footer)
+        go.clicked.connect(on_action)
+        footer.addWidget(go)
+        v.addLayout(footer)
 
-    def _open_releases(self):
+    def _open_and_accept(self, url: str, what: str):
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
 
-        if not QDesktopServices.openUrl(QUrl(self._url)):
-            log.warning("could not open releases page in browser: %s", self._url)
+        if not QDesktopServices.openUrl(QUrl(url)):
+            log.warning("could not open %s in browser: %s", what, url)
         self.accept()
 
 
-class StarPromptNotifier(QDialog):
+class UpdateNotifier(_ToastCard):
+    """'New version available' card. Static copy, dynamic versions, so there's
+    no per-release content to maintain. Download opens the releases page
+    (where the auto-generated changelog already lives)."""
+
+    def __init__(self, parent, current: str, latest: str, url: str):
+        self._url = url
+        super().__init__(
+            parent,
+            "Update available",
+            "Update available",
+            f"Sunnify {current} → {latest}",
+            "Download the new version from the releases page to get the latest "
+            "fixes and improvements.",
+            "Remind me later",
+            "Download",
+            self._open_releases,
+        )
+
+    def _open_releases(self):
+        self._open_and_accept(self._url, "releases page")
+
+
+class StarPromptNotifier(_ToastCard):
     """One-time 'star the repo' card, shown the moment the first song of the
     user's first download lands on disk (owner call: value is proven by a
     real file and the user is mid-wait; huge playlists never reach
-    'complete' in one sitting, so completion was the wrong hook). Same card
-    pattern as UpdateNotifier so it inherits the high-dpi behaviour verified
-    for 2.0.13. Shown exactly once per install: the config flag is persisted
-    before the dialog opens, so even a crash mid-dialog can never make it
-    nag twice."""
+    'complete' in one sitting, so completion was the wrong hook). Shown
+    exactly once per install: the config flag is persisted before the dialog
+    opens, so even a crash mid-dialog can never make it nag twice."""
 
     def __init__(self, parent):
-        super().__init__(parent)
-        from PyQt6.QtGui import QColor, QFont, QFontMetrics
-        from PyQt6.QtWidgets import QFrame, QLabel, QWidget
-
         self._url = f"https://github.com/{GITHUB_REPO}"
-        self.setWindowTitle("Enjoying Sunnify?")
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setModal(True)
-        self.setFont(QFont("Arial", 10))
-
-        green, green_hover = "#1ED760", "#1FE968"
-        cyan, purple = "rgba(80, 214, 255, 255)", "rgba(112, 32, 213, 255)"
-        ink, mute = "#15151F", "#7A7A8C"
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(28, 26, 28, 30)  # room for the drop shadow
-        # fractional dpi under-measures the wrapped body and squeezes the card (#64)
-        outer.setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)
-
-        card = QFrame()
-        card.setObjectName("card")
-        card.setFixedWidth(430)
-        card.setStyleSheet("QFrame#card{background:#FFFFFF;border-radius:18px;}")
-        shadow = QGraphicsDropShadowEffect(blurRadius=48, xOffset=0, yOffset=16)
-        shadow.setColor(QColor(20, 10, 40, 110))
-        card.setGraphicsEffect(shadow)
-        outer.addWidget(card)
-
-        v = QVBoxLayout(card)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
-
-        header = QFrame()
-        header.setObjectName("hdr")
-        header.setStyleSheet(
-            "QFrame#hdr{border-top-left-radius:18px;border-top-right-radius:18px;"
-            f"background:qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1,"
-            f"stop:0.23 {cyan}, stop:0.81 {purple});}}"
+        super().__init__(
+            parent,
+            "Enjoying Sunnify?",
+            "First song downloaded",
+            "Enjoying Sunnify?",
+            "A star on GitHub keeps this project alive: it's how new people find "
+            "Sunnify, and it takes five seconds. This asks once and never again.",
+            "Maybe later",
+            "Star on GitHub",
+            self._open_repo,
         )
-        hv = QVBoxLayout(header)
-        hv.setContentsMargins(26, 20, 26, 22)
-        hv.setSpacing(0)  # gaps are set explicitly between rows below
-
-        eyebrow = QLabel("FIRST SONG DOWNLOADED")
-        ef = QFont("Arial", 9, QFont.Weight.Bold)
-        ef.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
-        eyebrow.setFont(ef)
-        eyebrow.setStyleSheet("color: rgba(255,255,255,0.85);")
-        hv.addWidget(eyebrow)
-        hv.addSpacing(8)
-
-        name = QLabel("Enjoying Sunnify?")
-        nfont = QFont("Arial", 22, QFont.Weight.Bold)
-        name.setFont(nfont)
-        name.setStyleSheet("color: #FFFFFF;")
-        # large bold glyphs exceed QLabel's tight default box; reserve full height
-        name.setMinimumHeight(QFontMetrics(nfont).height() + 10)
-        hv.addWidget(name)
-        hv.addSpacing(6)  # descender room; 'j'/'y'/'g' tails clip at 1.5x without it
-        v.addWidget(header)
-
-        body = QWidget()
-        bv = QVBoxLayout(body)
-        bv.setContentsMargins(26, 22, 26, 6)
-        msg = QLabel(
-            "A star on GitHub keeps this project alive - it's how new people "
-            "find Sunnify, and it takes five seconds. This asks once and never "
-            "again."
-        )
-        msg.setWordWrap(True)
-        msg.setFont(QFont("Arial", 10))
-        msg.setStyleSheet(f"color: {mute};")
-        bv.addWidget(msg)
-        v.addWidget(body)
-
-        footer = QWidget()
-        fv = QHBoxLayout(footer)
-        fv.setContentsMargins(26, 8, 26, 22)
-        fv.setSpacing(10)
-
-        later = QPushButton("Maybe later")
-        later.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        later.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        later.setFixedHeight(40)
-        # pad right so the invisible hit area matches the other card's dismiss
-        later.setStyleSheet(
-            f"QPushButton{{background:transparent;color:{mute};border:none;"
-            "text-align:left;padding-right:32px;}"
-            f"QPushButton:hover{{color:{ink};}}"
-        )
-        later.clicked.connect(self.reject)
-        fv.addWidget(later)
-        fv.addStretch(1)
-
-        star = QPushButton("Star on GitHub")
-        star.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        sfont = QFont("Arial", 10, QFont.Weight.Bold)
-        star.setFont(sfont)
-        star.setFixedHeight(40)
-        # metrics-derived width; a fixed box clips when linux substitutes arial
-        star.setMinimumWidth(QFontMetrics(sfont).horizontalAdvance("Star on GitHub") + 44)
-        star.setStyleSheet(
-            f"QPushButton{{background:{green};color:white;border-radius:10px;"
-            "padding-left:18px;padding-right:18px;}"
-            f"QPushButton:hover{{background:{green_hover};}}"
-        )
-        star.clicked.connect(self._open_repo)
-        fv.addWidget(star)
-        v.addWidget(footer)
 
     def _open_repo(self):
-        from PyQt6.QtCore import QUrl
-        from PyQt6.QtGui import QDesktopServices
-
-        if not QDesktopServices.openUrl(QUrl(self._url)):
-            log.warning("could not open repo page in browser: %s", self._url)
-        self.accept()
+        self._open_and_accept(self._url, "repo page")
 
 
 # Main Window
+# inner text widths of the activity card and the preview drawer (see Template.py)
+ACTIVITY_TEXT_WIDTH = 248
+PREVIEW_TEXT_WIDTH = 288
+
+
 class MainWindow(QMainWindow, Ui_MainWindow):
     def __init__(self):
         """MainWindow constructor"""
         super().__init__()
         self.setupUi(self)
-        # let the options row size to its content so "Add Meta Tags" isn't clipped
-        # by the .ui's fixed-width container (varies with font/locale/dpi)
-        self.horizontalLayoutWidget_5.adjustSize()
 
         # Load persisted user config so format/quality/folder survive restarts
         self._config = load_config()
@@ -2647,12 +3079,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self._is_downloading = False  # Track download state for stop button
         self._queue: collections.deque[str] = collections.deque()
         self._current_link = ""
+        self._has_track = False  # did the current run get as far as naming a song?
         self._idle_placeholder = self.PlaylistLink.placeholderText()
         self._cancel_event = threading.Event()  # Event for cooperative thread cancellation
 
-        self.SONGINFORMATION.setGraphicsEffect(
-            QGraphicsDropShadowEffect(blurRadius=25, xOffset=2, yOffset=2)
-        )
+        # the window is transparent, so each card draws its own shadow
+        for card in (self.frame, self.SONGINFORMATION):
+            card.setGraphicsEffect(
+                QGraphicsDropShadowEffect(
+                    blurRadius=20, xOffset=0, yOffset=2, color=QColor(0, 0, 0, 90)
+                )
+            )
         self.PlaylistLink.returnPressed.connect(self._on_link_entered)
         self.DownloadBtn.clicked.connect(self.on_returnButton)
 
@@ -2661,11 +3098,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.Closed.clicked.connect(self.exitprogram)
         self.Select_Home.clicked.connect(self.Linkedin)
         self.SettingsBtn.clicked.connect(self.open_settings)
-
-        # No Album row: the unauthenticated embed endpoints never expose
-        # album name, and a missing row beats a permanently blank one.
-        self.label_8.hide()
-        self.AlbumText.hide()
+        self._preview_cover_url = None
+        self._last_report: dict | None = None
+        self._report_dialog = None
+        self.ReportBtn.clicked.connect(self.show_report)
+        counter_font = self.CounterLabel.font()
+        counter_font.setFeature(QFont.Tag("tnum"), 1)
+        self.CounterLabel.setFont(counter_font)
 
         # check for a newer release in the background; fail-silent, shows a toast only if found
         self._update_thread = UpdateCheckThread(__version__)
@@ -2881,7 +3320,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self._queue.extend(new)
         self.PlaylistLink.clear()
         self.statusMsg.setText(
-            f"Queued {len(new)} link(s), {len(self._queue)} waiting"
+            f"Queued {_counted(len(new), 'link')}, {len(self._queue)} waiting"
             if new
             else "That link is already downloading or queued"
         )
@@ -2891,10 +3330,48 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if not self._is_downloading:
             hint = self._idle_placeholder
         elif self._queue:
-            hint = f"{len(self._queue)} queued - paste another link and press Enter"
+            hint = f"{len(self._queue)} queued - paste another, press Enter"
         else:
-            hint = "Paste another link and press Enter to queue it"
+            hint = "Paste another link, press Enter to queue"
         self.PlaylistLink.setPlaceholderText(hint)
+
+    def _set_download_running(self, running: bool):
+        self.DownloadBtn.setText("Stop" if running else "Download")
+        self.DownloadBtn.setProperty("running", running)
+        # qss only re-reads a dynamic property on a re-polish
+        self.DownloadBtn.style().unpolish(self.DownloadBtn)
+        self.DownloadBtn.style().polish(self.DownloadBtn)
+
+    def _set_activity_visible(self, active: bool):
+        """Swap the card between the idle hint and live progress, so nothing
+        shows as an empty field or a zero count before there's data for it."""
+        self.idleBox.setVisible(not active)
+        self.activeBox.setVisible(active)
+        self.SongDownloadprogress.setVisible(active)
+        side = Qt.AlignmentFlag.AlignLeft if active else Qt.AlignmentFlag.AlignHCenter
+        self.statusMsg.setAlignment(Qt.AlignmentFlag.AlignTop | side)
+        if not active:
+            self.CounterLabel.hide()
+            self.ReportBtn.hide()
+
+    def _set_release_line(self, album: str, release_date: str):
+        """Album and year on one muted line, the way streaming apps credit a
+        release ("Is This It · 2001"); a full date would be noise here."""
+        match = re.match(r"\d{4}", release_date or "")
+        parts = [p for p in ((album or "").strip(), match.group(0) if match else "") if p]
+        if not parts:
+            self.YearText.setText("")
+            return
+        self._set_elided(self.YearText, " · ".join(parts), PREVIEW_TEXT_WIDTH)
+
+    @staticmethod
+    def _set_elided(label, text: str, width: int, lines: int = 1):
+        """Fit text in a fixed-size label with an ellipsis; tooltip keeps all of it.
+        Wrapped lines break at spaces and waste some width, hence the 0.9."""
+        label.ensurePolished()
+        room = width if lines == 1 else int(width * lines * 0.9)
+        label.setText(label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, room))
+        label.setToolTip(text)
 
     def _start_download(self, spotify_url: str):
         try:
@@ -2907,7 +3384,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._current_link = spotify_url
             self.PlaylistLink.clear()
             self._is_downloading = True
-            self.DownloadBtn.setText("Stop")
+            self._set_download_running(True)
+
+            self._has_track = False
+            self.playlistCaption.setText(url_type.capitalize())
+            self._set_elided(self.AlbumName, "Fetching details...", ACTIVITY_TEXT_WIDTH)
+            self._set_elided(
+                self.MainSongName, "Waiting for the first song...", ACTIVITY_TEXT_WIDTH
+            )
+            self.CounterLabel.hide()
+            self._set_counter_warn(False)
+            self.ReportBtn.hide()
+            self.PlaylistMsg_2.setText("Now downloading")
+            self._set_activity_visible(True)
 
             self.scraper_thread = ScraperThread(
                 spotify_url,
@@ -2938,14 +3427,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         except ValueError as e:
             self.statusMsg.setText(str(e))
             self._is_downloading = False
-            self.DownloadBtn.setText("Download")
+            self._set_download_running(False)
+            self._set_activity_visible(False)
 
     def _stop_download(self):
         """Stop the current download gracefully using cooperative cancellation."""
         dropped = len(self._queue)
         self._queue.clear()
         self.statusMsg.setText(
-            f"Stopping download ({dropped} queued link(s) cleared)..."
+            f"Stopping download ({_counted(dropped, 'queued link')} cleared)..."
             if dropped
             else "Stopping download..."
         )
@@ -2960,15 +3450,52 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def thread_finished(self):
         """Reset UI state when download thread finishes."""
+        self._collect_report()
         self._is_downloading = False
         self._current_link = ""
-        self.DownloadBtn.setText("Download")
+        self._set_download_running(False)
         self.DownloadBtn.setEnabled(True)
+        if not self._has_track:
+            # failed or cancelled before any song: statusMsg still says why
+            self._set_activity_visible(False)
+        else:
+            self.PlaylistMsg_2.setText("Last song")
         if hasattr(self, "scraper_thread"):
             self.scraper_thread.deleteLater()  # Clean up the thread properly
         if self._queue and not self._cancel_event.is_set():
             self._start_download(self._queue.popleft())
         self._update_queue_hint()
+
+    def _collect_report(self):
+        """Keep the finished run's report and surface it when there is
+        something in it: a button in the card always, the window too unless
+        the run was stopped (the user already knows it's incomplete)."""
+        scraper = self._live_scraper()
+        entries = list(getattr(scraper, "_report", None) or [])
+        if not entries:
+            return
+        self._last_report = {
+            "name": getattr(scraper, "_report_name", "") or "",
+            "folder": getattr(scraper, "_report_folder", "") or "",
+            "total": getattr(scraper, "_total_tracks", 0) or 0,
+            "entries": entries,
+            "network_blocked": bool(getattr(scraper, "_network_blocked", False)),
+        }
+        self.ReportBtn.setText("View report")
+        self.ReportBtn.show()
+        if not self._cancel_event.is_set():
+            self.show_report()
+
+    def show_report(self):
+        if not self._last_report:
+            return
+        if self._report_dialog is not None:
+            # one report window at a time: the newest run replaces the last
+            self._report_dialog.close()
+            self._report_dialog.deleteLater()
+        self._report_dialog = RunReportDialog(self, self._last_report)
+        self._report_dialog.show()
+        self._report_dialog.raise_()
 
     def update_progress(self, message):
         self.statusMsg.setText(message)
@@ -2978,11 +3505,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Update UI with current track info (called BEFORE download starts)."""
         if self.showPreviewCheck.isChecked():
             cover_url = song_meta.get("cover", "")
+            self._preview_cover_url = cover_url
             if cover_url:
                 thumb_thread = DownloadThumbnail(cover_url, self)
                 self._active_threads.append(thumb_thread)
                 thumb_thread.finished.connect(lambda: self._cleanup_thread(thumb_thread))
                 thumb_thread.start()
+            else:
+                self.CoverImg.clear()
             artists_full = song_meta.get("artists", "")
             artist_list = [a.strip() for a in artists_full.split(",") if a.strip()]
             if len(artist_list) > 2:
@@ -2991,11 +3521,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 artists_display = artists_full
             self.ArtistNameText.setText(artists_display)
             self.ArtistNameText.setToolTip(artists_full)
-            self.AlbumText.setText(song_meta.get("album", ""))
-            self.SongName.setText(song_meta.get("title", ""))
-            self.YearText.setText(song_meta.get("releaseDate", ""))
+            self._set_elided(self.SongName, song_meta.get("title", ""), PREVIEW_TEXT_WIDTH, lines=2)
+            self._set_release_line(song_meta.get("album", ""), song_meta.get("releaseDate", ""))
 
-        self.MainSongName.setText(song_meta.get("title", "") + " - " + song_meta.get("artists", ""))
+        self._has_track = True
+        self._set_elided(
+            self.MainSongName,
+            song_meta.get("title", "") + " - " + song_meta.get("artists", ""),
+            ACTIVITY_TEXT_WIDTH,
+            lines=2,
+        )
         # NOTE: Meta tags are written in add_song_META (after file exists), not here
 
     @pyqtSlot(dict)
@@ -3014,7 +3549,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     @pyqtSlot(str)
     def update_AlbumName(self, AlbumName):
-        self.AlbumName.setText("Playlist Name : " + AlbumName)
+        self._set_elided(self.AlbumName, AlbumName, ACTIVITY_TEXT_WIDTH)
 
     def _live_scraper(self):
         """The running scraper, or None once the thread is gone (qt raises
@@ -3033,21 +3568,33 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         total = getattr(scraper, "_total_tracks", 0) or 0
         failed = self._failed_track_count()
         # count is "tracks finished", not "tracks saved": a failure ticks it too
-        text = f"Songs downloaded {max(0, count - failed)}"
+        done = max(0, count - failed)
         if total:
-            text += f" of {total}"
+            # tracklist style, padded so the digits don't shift as it counts
+            width = max(2, len(str(total)))
+            text = f"{done:0{width}d} / {total:0{width}d} downloaded"
+        else:
+            text = f"{done} downloaded"
         if failed:
-            text += f" ({failed} failed)"
+            text += f" · {failed} failed"
         self.CounterLabel.setText(text)
+        self._set_counter_warn(bool(failed))
+        self.CounterLabel.show()
+
+    def _set_counter_warn(self, warn: bool):
+        """Green while everything lands, soft red once anything failed."""
+        if bool(self.CounterLabel.property("warn")) == warn:
+            return
+        self.CounterLabel.setProperty("warn", warn)
+        self.CounterLabel.style().unpolish(self.CounterLabel)
+        self.CounterLabel.style().polish(self.CounterLabel)
 
     @pyqtSlot(int)
     def update_song_progress(self, progress):
-        self.SongDownloadprogressBar.setValue(progress)
         self.SongDownloadprogress.setValue(progress)
 
     @pyqtSlot(int)
     def Reset_song_progress(self, progress):
-        self.SongDownloadprogressBar.setValue(0)
         self.SongDownloadprogress.setValue(0)
 
     # DRAGGLESS INTERFACE
@@ -3073,14 +3620,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def CloseSongInformation(self):
         self.animation = QPropertyAnimation(self.SONGINFORMATION, b"size")
         self.animation.setDuration(250)
-        self.animation.setEndValue(QSize(0, 440))
+        self.animation.setEndValue(QSize(0, 480))
         self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.animation.start()
 
     def OpenSongInformation(self):
         self.animation = QPropertyAnimation(self.SONGINFORMATION, b"size")
-        self.animation.setDuration(1000)
-        self.animation.setEndValue(QSize(350, 440))
+        self.animation.setDuration(250)
+        self.animation.setEndValue(QSize(350, 480))
         self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.animation.start()
 
@@ -3160,9 +3707,10 @@ if __name__ == "__main__":
     _signal_waker.start(200)
     _signal_waker.timeout.connect(lambda: None)
     Screen = MainWindow()
-    Screen.setFixedHeight(500)
+    Screen.setFixedHeight(540)
     Screen.setFixedWidth(750)
-    Screen.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+    # no OS shadow: macOS would trace a hard outline around the cards' soft ones
+    Screen.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
     Screen.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     Screen.show()
     sys.exit(app.exec())

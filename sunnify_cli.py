@@ -297,6 +297,7 @@ def cmd_download(args) -> int:
         title_only=scraper.title_only,
         track_numbers=scraper.include_track_number,
         loose_match=scraper.loose_match,
+        prefer_extended=scraper.prefer_extended,
         cookies=bool(scraper.cookies_file),
     )
     t0 = time.monotonic()
