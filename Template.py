@@ -547,7 +547,7 @@ class Ui_MainWindow(object):
         # carries real news (errors, "Settings saved", a finished run)
         self.statusMsg.setText("")
         self.Select_Home.setText(_translate("MainWindow", "Follow me on LinkedIn  ↗"))
-        self.version.setText(_translate("MainWindow", "V2.6.0"))
+        self.version.setText(_translate("MainWindow", "V2.7.0"))
         self.showPreviewCheck.setText(_translate("MainWindow", "Show preview"))
         self.AddMetaDataCheck.setText(_translate("MainWindow", "Add meta tags"))
         self.label_3.setText(_translate("MainWindow", "Song information"))
